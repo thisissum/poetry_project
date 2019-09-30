@@ -3,10 +3,8 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence as pack
 from torch.nn.utils.rnn import pad_packed_sequence as unpack
-from tqdm import tqdm
 import numpy as np
 import os
-from tools import *
 
 
 class GRUEncoder(nn.Module):
@@ -102,124 +100,42 @@ class MaskCrossEntropyLoss(nn.Module):
             torch.log(torch.gather(y_pred, dim=1,
                                    index=y_true.reshape(-1, 1))).squeeze(1)
         loss = cross_entropy.masked_select(
-            mask.type(torch.BoolTensor).to(device)).mean()
+            mask.type(torch.ByteTensor).to(device)).mean()
         return loss.to(device), total_num.item()
 
 
-class Seq2seqCoach(object):
-
+class GreedyInference(object):
+    """
+    """
     def __init__(self, 
-                 epochs,
-                 device,
+                 max_input_len,
+                 max_output_len,  
                  pad_token=0,
-                 sos_token=1,
-                 eos_token=2,
-                 teacher_forcing_ratio=0.9,
-                 clip=2.0,
-                 save_checkpoint_epoch=1):
-        self.epochs = epochs
-        self.device = device
+                 sos_token=1,  
+                 eos_token=2):
+        self.max_input_len = max_input_len
+        self.max_output_len = max_output_len
         self.pad_token = pad_token
         self.sos_token = sos_token
         self.eos_token = eos_token
-        self.teacher_forcing_ratio = teacher_forcing_ratio
-        self.clip = clip
-        self.save_checkpoint_epoch = save_checkpoint_epoch
+    
+    def inference(self, input_seq, encoder, decoder):
+        assert len(input_seq) <= self.max_input_len, '输入过长'
+        device = input_seq.device
+        
+        inference_ids = []
+        with torch.no_grad():
+            encoder_out, encoder_hidden = encoder(input_seq)
+            decoder_hidden = encoder_hidden[:decoder.gru_decoder.num_layers]
+            decoder_input = torch.LongTensor([[self.sos_token]]).to(device)
 
-    def train(self, dataloader, encoder, decoder, encoder_opt, decoder_opt, criterion):
-        for epoch in range(self.epochs):
-            epoch_loss = []
-            for inputs, targets in tqdm(dataloader):
-                input_length = torch.max((inputs!=self.pad_token).type(torch.LongTensor).sum(axis=1))
-                target_length = torch.max((targets!=self.pad_token).type(torch.LongTensor).sum(axis=1))
+            for _ in range(self.max_output_len):
+                decoder_out, decoder_hidden = decoder(decoder_input, decoder_hidden, encoder_out)
+                decoder_input = decoder_out.argmax(dim=1).unsqueeze(0)
+                inference_ids.append(decoder_input.item())
+                if decoder_input.item() == self.eos_token:
+                    break
+        
+        return inference_ids
 
-                inputs = inputs[:,:input_length].to(self.device)
-                targets = targets[:,:target_length].to(self.device)
-                mask = (targets != self.pad_token).type(
-                    torch.FloatTensor).to(self.device)
-
-                iter_loss = self.train_iter(
-                    inputs, targets, mask, encoder, decoder, encoder_opt, decoder_opt, criterion)
-
-                print('current loss: {}'.format(iter_loss))
-                epoch_loss.append(iter_loss)
-
-            print('epoch: {}  loss: {}'.format(epoch+1, np.mean(epoch_loss)))
-
-            # save checkpoint
-            if epoch % self.save_checkpoint_epoch == 0:
-                dictionary = os.path.join('./', 'checkpoint')
-                if not os.path.exists(dictionary):
-                    os.makedirs(dictionary)
-                torch.save({
-                    'epoch': epoch+1,
-                    'encoder': encoder.state_dict(),
-                    'decoder': decoder.state_dict(),
-                    'encoder_opt': encoder_opt.state_dict(),
-                    'decoder_opt': decoder_opt.state_dict(),
-                    'loss': np.mean(epoch_loss)
-                }, os.path.join(dictionary, '{}_{}'.format('checkpoint', epoch+1)))
-
-    def train_iter(self, 
-                   inputs,
-                   targets,
-                   mask,
-                   encoder,
-                   decoder,
-                   encoder_opt,
-                   decoder_opt,
-                   criterion):
-        # get device
-        device = inputs.device
-        batch_size, time_step = targets.shape
-
-        # clear optimizer's grad
-        encoder_opt.zero_grad()
-        decoder_opt.zero_grad()
-
-        losses = []
-        sum_loss = 0
-        n_totals = 0
-        encoder_out, encoder_hidden = encoder(inputs)
-
-        decoder_input = torch.LongTensor(
-            [[self.sos_token] for _ in range(batch_size)]).to(device)
-        decoder_hidden = encoder_hidden[:decoder.gru_decoder.num_layers]
-
-        use_teacher_forcing = True if torch.rand(
-            1).item() < self.teacher_forcing_ratio else False
-
-        # decode seq step by step
-        if use_teacher_forcing:
-            for i in range(time_step):
-                decoder_out, decoder_hidden = decoder(
-                    decoder_input, decoder_hidden, encoder_out)
-                decoder_input = targets[:, i].view(-1, 1)
-
-                loss, total_num = criterion(
-                    decoder_out, targets[:, i], mask[:, i])
-                sum_loss += loss
-                losses.append(loss.item() * total_num)
-                n_totals += total_num
-        else:
-            for i in range(time_step):
-                decoder_out, decoder_hidden = decoder(
-                    decoder_input, decoder_hidden, encoder_out)
-                decoder_input = decoder_out.argmax(axis=1).view(-1,1)
-
-                loss, total_num = criterion(
-                    decoder_out, targets[:, i], mask[:, i])
-                sum_loss += loss
-                losses.append(loss.item() * total_num)
-                n_totals += total_num
-
-        sum_loss.backward()
-
-        # grad clip
-        torch.nn.utils.clip_grad_norm_(encoder.parameters(), self.clip)
-        torch.nn.utils.clip_grad_norm_(encoder.parameters(), self.clip)
-
-        encoder_opt.step()
-        decoder_opt.step()
-
-        return sum(losses) / n_totals
+            
